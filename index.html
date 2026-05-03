@@ -302,19 +302,24 @@ const TF_DAYS = {'4H':1,'1D':1,'1W':7,'1M':30,'6M':180,'1Y':365};
 let chartTF    = {};   // sym → tf string
 let chartCache = {};   // "sym_tf" → pts array
 
+// Binance klines intervals
+const BN_INTERVAL = {'4H':'15m','1D':'1h','1W':'4h','1M':'1d','6M':'3d','1Y':'1w'};
+const BN_LIMIT    = {'4H':16,   '1D':24, '1W':42,  '1M':30, '6M':60, '1Y':52};
+
 async function fetchCryptoChart(sym, tf) {
   const key = sym + '_' + tf;
   if (chartCache[key]) return chartCache[key];
-  const days = TF_DAYS[tf] || 1;
-  const id   = geckoId(sym);
+  const bsym     = BINANCE_SYM[sym] || (sym + 'USDT');
+  const interval = BN_INTERVAL[tf] || '1h';
+  const limit    = BN_LIMIT[tf]    || 24;
   try {
-    const r = await fetch(`https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=${days}`);
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${bsym}&interval=${interval}&limit=${limit}`);
+    if (!r.ok) return null;
     const d = await r.json();
-    if (!d.prices || !d.prices.length) return null;
-    let pts = d.prices.map(p => ({ t: p[0], v: p[1] }));
-    if (tf === '4H') pts = pts.slice(-17);   // last ~4h of hourly data
+    if (!d || !d.length) return null;
+    const pts = d.map(k => ({ t: k[0], v: parseFloat(k[4]) })); // close price
     chartCache[key] = pts;
-    setTimeout(() => { delete chartCache[key]; }, 300000); // expire 5min
+    setTimeout(() => { delete chartCache[key]; }, 300000);
     return pts;
   } catch(e) { return null; }
 }
@@ -441,30 +446,70 @@ mktStatus();
 // ═══════════════════════════════════════════════
 // FETCH
 // ═══════════════════════════════════════════════
+// ── Binance ticker symbols
+const BINANCE_SYM = {
+  BTC:'BTCUSDT',ETH:'ETHUSDT',SOL:'SOLUSDT',BNB:'BNBUSDT',XRP:'XRPUSDT',
+  ADA:'ADAUSDT',DOGE:'DOGEUSDT',AVAX:'AVAXUSDT',DOT:'DOTUSDT',LINK:'LINKUSDT',
+  MATIC:'MATICUSDT',UNI:'UNIUSDT',ATOM:'ATOMUSDT',LTC:'LTCUSDT',TRX:'TRXUSDT',
+  TON:'TONUSDT',SHIB:'SHIBUSDT',APT:'APTUSDT',OP:'OPUSDT',ARB:'ARBUSDT',
+};
+
 async function fetchCrypto() {
   try {
-    const ids = AC.map(geckoId).join(',');
-    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
-    const d = await r.json(), out = {};
+    // Fetch all 24h tickers from Binance in one call
+    const r = await fetch('https://api.binance.com/api/v3/ticker/24hr');
+    if (!r.ok) throw new Error('binance ' + r.status);
+    const all = await r.json();
+    const map = {};
+    all.forEach(t => { map[t.symbol] = t; });
+
+    // Fetch USD/JPY and USD/THB for conversion
+    const fxr = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
+    const fx  = fxr.ok ? await fxr.json() : null;
+    const usdJpy = fx?.rates?.JPY || 150;
+    const usdThb = fx?.rates?.THB || 34;
+
+    const out = {};
+    const missing = [];
     AC.forEach(s => {
-      const id = geckoId(s);
-      if (d[id]) out[s] = { name:s, usd:d[id].usd, jpy:d[id].jpy, thb:d[id].thb, change:d[id].usd_24h_change||0, cat:'CRYPTO' };
+      const bsym = BINANCE_SYM[s] || (s + 'USDT');
+      const t = map[bsym];
+      if (t) {
+        const usd = parseFloat(t.lastPrice);
+        out[s] = { name:s, cat:'CRYPTO', usd, jpy:usd*usdJpy, thb:usd*usdThb, change:parseFloat(t.priceChangePercent)||0 };
+      } else {
+        missing.push(s); // not on Binance (e.g. PSOL, JUPSOL)
+      }
     });
+    // Fallback: try CoinGecko for missing symbols
+    if (missing.length) {
+      try {
+        const ids = missing.map(geckoId).join(',');
+        const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
+        if (gr.ok) {
+          const gd = await gr.json();
+          missing.forEach(s => {
+            const id = geckoId(s);
+            if (gd[id]) out[s] = { name:s, cat:'CRYPTO', usd:gd[id].usd, jpy:gd[id].jpy, thb:gd[id].thb, change:gd[id].usd_24h_change||0 };
+          });
+        }
+      } catch(e2) { /* CoinGecko unavailable, skip */ }
+    }
     return out;
-  } catch(e) { console.error('crypto',e); return {}; }
+  } catch(e) { console.error('crypto fetch error:', e); return {}; }
 }
 
 async function fetchForex() {
   try {
-    const r = await fetch('https://open.er-api.com/v6/latest/USD');
+    const r = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
+    if (!r.ok) throw new Error('frankfurter ' + r.status);
     const d = await r.json();
-    if (!d.rates) throw new Error('no rates');
     const jpy = d.rates.JPY, thb = d.rates.THB;
     return {
       USDJPY: { name:'ドル円',  usd:1,     jpy:jpy,     thb:thb,   change:null, cat:'FOREX' },
       THBJPY: { name:'バーツ円', usd:1/thb, jpy:jpy/thb, thb:1,     change:null, cat:'FOREX' },
     };
-  } catch(e) { console.error('forex',e); return {}; }
+  } catch(e) { console.error('forex fetch error:', e); return {}; }
 }
 
 function fetchThai() {
