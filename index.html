@@ -392,6 +392,14 @@ select option{background:var(--panel-solid);}
 
 <div class="toast-container" id="toasts"></div>
 
+<div id="apiKeyBanner" style="display:none;background:#fff3cd;border:2px solid #b5860d;border-radius:12px;padding:14px 18px;margin:14px 20px 0;font-family:'M PLUS Rounded 1c',sans-serif;font-size:12px;color:#2c1810;z-index:50;position:relative;">
+  🔑 <strong>Anthropic APIキーが必要です</strong> — <a href="https://console.anthropic.com/" target="_blank" style="color:#8b3535;">console.anthropic.com</a> で無料取得できます
+  <div style="display:flex;gap:8px;margin-top:8px;">
+    <input type="password" id="apiKeyInput" placeholder="sk-ant-..." style="flex:1;padding:6px 10px;border:1.5px solid #b5860d;border-radius:8px;font-size:12px;outline:none;">
+    <button onclick="saveApiKey()" style="background:#8b3535;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-family:'M PLUS Rounded 1c',sans-serif;font-weight:700;cursor:pointer;">保存</button>
+  </div>
+</div>
+
 <header>
   <div class="logo">MARKET <span>HUB</span></div>
   <div class="header-right">
@@ -687,106 +695,108 @@ const BINANCE_SYM = {
 
 async function fetchCrypto() {
   try {
-    const bSyms = [...new Set(AC.map(s => BINANCE_SYM[s] || (s + 'USDT')))];
-    const symParam = encodeURIComponent(JSON.stringify(bSyms));
-    const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${symParam}`;
+    const cryptoList = AC.join(', ');
+    const prompt = `Give me the current live prices for these cryptocurrencies: ${cryptoList}.
+Return ONLY a JSON object like this (no markdown, no explanation):
+{"BTC":{"usd":95000,"jpy":14250000,"thb":3230000,"change":1.23},"ETH":{"usd":3200,"jpy":480000,"thb":108800,"change":-0.45}}
+Use real current prices. Include usd, jpy (usd*150), thb (usd*34), and 24h change percent.`;
 
-    const r = await fetch(url);
-    if (!r.ok) throw new Error('binance ' + r.status);
-    const tickers = await r.json();
-
-    // forex rates for conversion
-    let usdJpy = 150, usdThb = 34;
-    try {
-      const fx = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
-      if (fx.ok) { const fxd = await fx.json(); usdJpy = fxd.rates.JPY; usdThb = fxd.rates.THB; }
-    } catch(e) {}
-
-    const map = {};
-    tickers.forEach(t => { map[t.symbol] = t; });
-
-    const out = {}, missing = [];
-    AC.forEach(s => {
-      const bsym = BINANCE_SYM[s] || (s + 'USDT');
-      const t = map[bsym];
-      if (t) {
-        const usd = parseFloat(t.lastPrice);
-        out[s] = { name:s, cat:'CRYPTO', usd, jpy:usd*usdJpy, thb:usd*usdThb, change:parseFloat(t.priceChangePercent)||0 };
-      } else { missing.push(s); }
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': getApiKey(),
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1024,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }]
+      })
     });
 
-    // CoinGecko fallback for non-Binance tokens (PSOL, JUPSOL etc)
-    if (missing.length) {
-      try {
-        const ids = missing.map(geckoId).join(',');
-        const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
-        if (gr.ok) {
-          const gd = await gr.json();
-          missing.forEach(s => {
-            const id = geckoId(s);
-            if (gd[id]) out[s] = { name:s, cat:'CRYPTO', usd:gd[id].usd, jpy:gd[id].jpy, thb:gd[id].thb, change:gd[id].usd_24h_change||0 };
-          });
-        }
-      } catch(e) {}
-    }
+    if (!resp.ok) throw new Error('API ' + resp.status);
+    const data = await resp.json();
+
+    // Extract text from response
+    const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('no JSON in response');
+    const prices = JSON.parse(jsonMatch[0]);
+
+    const out = {};
+    AC.forEach(s => {
+      if (prices[s]) {
+        out[s] = { name:s, cat:'CRYPTO', usd:prices[s].usd, jpy:prices[s].jpy, thb:prices[s].thb, change:prices[s].change||0 };
+      }
+    });
     return out;
   } catch(e) {
     console.error('crypto fetch error:', e);
-    // Last resort: try CoinGecko for everything
-    try {
-      const ids = AC.map(geckoId).join(',');
-      const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
-      if (gr.ok) {
-        const gd = await gr.json();
-        const out = {};
-        AC.forEach(s => {
-          const id = geckoId(s);
-          if (gd[id]) out[s] = { name:s, cat:'CRYPTO', usd:gd[id].usd, jpy:gd[id].jpy, thb:gd[id].thb, change:gd[id].usd_24h_change||0 };
-        });
-        return out;
-      }
-    } catch(e2) {}
     return {};
   }
 }
 
 async function fetchForex() {
-  let jpy = 150, thb = 34;
   try {
-    const r = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
-    if (r.ok) { const d = await r.json(); jpy = d.rates.JPY; thb = d.rates.THB; }
+    const prompt = `Give me the current live exchange rates and gold/silver prices.
+Return ONLY a JSON object like this (no markdown, no explanation):
+{
+  "USDJPY": {"jpy": 153.5, "thb": 33.8},
+  "THBJPY": {"jpy": 4.54, "thb": 1},
+  "GOLD": {"usd": 3320, "jpy": 498000, "thb": 112880, "change": 0.45},
+  "SILVER": {"usd": 33.2, "jpy": 4980, "thb": 1128, "change": 0.32}
+}
+Use real current market rates.`;
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': getApiKey(),
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 512,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!resp.ok) throw new Error('API ' + resp.status);
+    const data = await resp.json();
+    const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('no JSON');
+    const rates = JSON.parse(jsonMatch[0]);
+
+    const jpy = rates.USDJPY?.jpy || 150;
+    const thb = rates.USDJPY?.thb || 34;
+
+    const metalsData = {};
+    if (rates.GOLD) {
+      metalsData['GOLD'] = { name:'ゴールド', icon:'🥇', unit:'Troy oz', cat:'METAL', ...rates.GOLD };
+    }
+    if (rates.SILVER) {
+      metalsData['SILVER'] = { name:'シルバー', icon:'🥈', unit:'Troy oz', cat:'METAL', ...rates.SILVER };
+    }
+
+    return {
+      USDJPY: { name:'ドル円',  usd:1, jpy, thb, change:null, cat:'FOREX' },
+      THBJPY: { name:'バーツ円', usd:1/thb, jpy:jpy/thb, thb:1, change:null, cat:'FOREX' },
+      ...metalsData,
+    };
   } catch(e) {
     console.error('forex fetch error:', e);
-    // fallback: try open.er-api
-    try {
-      const r2 = await fetch('https://open.er-api.com/v6/latest/USD');
-      if (r2.ok) { const d2 = await r2.json(); jpy = d2.rates.JPY; thb = d2.rates.THB; }
-    } catch(e2) {}
+    return {
+      USDJPY: { name:'ドル円',  usd:1, jpy:150, thb:34, change:null, cat:'FOREX' },
+      THBJPY: { name:'バーツ円', usd:1/34, jpy:150/34, thb:1, change:null, cat:'FOREX' },
+    };
   }
-
-  // Gold via PAXG on Binance
-  const metalsData = {};
-  try {
-    const mr = await fetch('https://api.binance.com/api/v3/ticker/24hr?symbols=' + encodeURIComponent('["PAXGUSDT"]'));
-    if (mr.ok) {
-      const md = await mr.json();
-      md.forEach(t => {
-        if (t.symbol === 'PAXGUSDT') {
-          const usd = parseFloat(t.lastPrice);
-          metalsData['GOLD'] = { name:'ゴールド', icon:'🥇', unit:'Troy oz', usd, jpy:usd*jpy, thb:usd*thb, change:parseFloat(t.priceChangePercent)||0, cat:'METAL' };
-          // Silver estimate from gold (ratio ~80)
-          const sUsd = usd / 80;
-          metalsData['SILVER'] = { name:'シルバー', icon:'🥈', unit:'Troy oz (概算)', usd:sUsd, jpy:sUsd*jpy, thb:sUsd*thb, change:metalsData['GOLD'].change * 0.85, cat:'METAL' };
-        }
-      });
-    }
-  } catch(e) { console.warn('metals error:', e); }
-
-  return {
-    USDJPY: { name:'ドル円',  usd:1, jpy, thb,    change:null, cat:'FOREX' },
-    THBJPY: { name:'バーツ円', usd:1/thb, jpy:jpy/thb, thb:1, change:null, cat:'FOREX' },
-    ...metalsData,
-  };
 }
 
 function fetchThai() {
@@ -1205,10 +1215,29 @@ function renderNews(cat) {
 }
 
 // ═══════════════════════════════════════════════
+// API KEY MANAGEMENT
+// ═══════════════════════════════════════════════
+function getApiKey() { return localStorage.getItem('mhApiKey') || ''; }
+function saveApiKey() {
+  const k = document.getElementById('apiKeyInput').value.trim();
+  if (!k.startsWith('sk-ant-')) { toast('エラー', 'APIキーは sk-ant- で始まります', true); return; }
+  localStorage.setItem('mhApiKey', k);
+  document.getElementById('apiKeyBanner').style.display = 'none';
+  toast('保存完了', 'APIキーを保存しました。データ取得を開始します...');
+  fetchAll();
+}
+
+// ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
 async function init() {
-  await fetchAll();
+  const key = getApiKey();
+  if (!key) {
+    document.getElementById('apiKeyBanner').style.display = 'block';
+    toast('🔑 APIキー未設定', '画面上のバナーからAPIキーを入力してください', false);
+  } else {
+    await fetchAll();
+  }
   const o = document.getElementById('lo');
   setTimeout(() => { o.style.opacity='0'; setTimeout(()=>o.remove(),500); }, 900);
   setInterval(fetchAll, 60000);
