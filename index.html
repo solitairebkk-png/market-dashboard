@@ -687,24 +687,23 @@ const BINANCE_SYM = {
 
 async function fetchCrypto() {
   try {
-    // Fetch only needed symbols from Binance (smaller, faster)
-    const bSyms = AC.map(s => BINANCE_SYM[s] || (s + 'USDT'));
-    const validBSyms = bSyms.filter(s => s.endsWith('USDT'));
+    const bSyms = [...new Set(AC.map(s => BINANCE_SYM[s] || (s + 'USDT')))];
+    const symParam = encodeURIComponent(JSON.stringify(bSyms));
+    const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${symParam}`;
 
-    // Use individual ticker endpoint with multiple symbols
-    const symParam = JSON.stringify(validBSyms);
-    const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symParam)}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const r = await fetch(url);
     if (!r.ok) throw new Error('binance ' + r.status);
-    const all = await r.json();
-    const map = {};
-    all.forEach(t => { map[t.symbol] = t; });
+    const tickers = await r.json();
 
-    // Get forex rates
-    const fxr = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB', { signal: AbortSignal.timeout(8000) }).catch(() => null);
-    const fx = fxr?.ok ? await fxr.json() : null;
-    const usdJpy = fx?.rates?.JPY || 150;
-    const usdThb = fx?.rates?.THB || 34;
+    // forex rates for conversion
+    let usdJpy = 150, usdThb = 34;
+    try {
+      const fx = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
+      if (fx.ok) { const fxd = await fx.json(); usdJpy = fxd.rates.JPY; usdThb = fxd.rates.THB; }
+    } catch(e) {}
+
+    const map = {};
+    tickers.forEach(t => { map[t.symbol] = t; });
 
     const out = {}, missing = [];
     AC.forEach(s => {
@@ -713,16 +712,14 @@ async function fetchCrypto() {
       if (t) {
         const usd = parseFloat(t.lastPrice);
         out[s] = { name:s, cat:'CRYPTO', usd, jpy:usd*usdJpy, thb:usd*usdThb, change:parseFloat(t.priceChangePercent)||0 };
-      } else {
-        missing.push(s);
-      }
+      } else { missing.push(s); }
     });
 
-    // CoinGecko fallback for missing
+    // CoinGecko fallback for non-Binance tokens (PSOL, JUPSOL etc)
     if (missing.length) {
       try {
         const ids = missing.map(geckoId).join(',');
-        const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`, { signal: AbortSignal.timeout(8000) });
+        const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
         if (gr.ok) {
           const gd = await gr.json();
           missing.forEach(s => {
@@ -730,51 +727,67 @@ async function fetchCrypto() {
             if (gd[id]) out[s] = { name:s, cat:'CRYPTO', usd:gd[id].usd, jpy:gd[id].jpy, thb:gd[id].thb, change:gd[id].usd_24h_change||0 };
           });
         }
-      } catch(e2) {}
+      } catch(e) {}
     }
     return out;
-  } catch(e) { console.error('crypto fetch error:', e); return {}; }
+  } catch(e) {
+    console.error('crypto fetch error:', e);
+    // Last resort: try CoinGecko for everything
+    try {
+      const ids = AC.map(geckoId).join(',');
+      const gr = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,jpy,thb&include_24hr_change=true`);
+      if (gr.ok) {
+        const gd = await gr.json();
+        const out = {};
+        AC.forEach(s => {
+          const id = geckoId(s);
+          if (gd[id]) out[s] = { name:s, cat:'CRYPTO', usd:gd[id].usd, jpy:gd[id].jpy, thb:gd[id].thb, change:gd[id].usd_24h_change||0 };
+        });
+        return out;
+      }
+    } catch(e2) {}
+    return {};
+  }
 }
-
 
 async function fetchForex() {
+  let jpy = 150, thb = 34;
   try {
-    // 為替レート (Frankfurter with timeout)
-    const fxR = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB', { signal: AbortSignal.timeout(8000) });
-    if (!fxR.ok) throw new Error('frankfurter ' + fxR.status);
-    const d = await fxR.json();
-    const jpy = d.rates.JPY, thb = d.rates.THB;
-
-    // 貴金属: PAXGUSDTをBinanceから（個別取得）
-    const metalsData = {};
+    const r = await fetch('https://api.frankfurter.app/latest?from=USD&to=JPY,THB');
+    if (r.ok) { const d = await r.json(); jpy = d.rates.JPY; thb = d.rates.THB; }
+  } catch(e) {
+    console.error('forex fetch error:', e);
+    // fallback: try open.er-api
     try {
-      const metalSyms = JSON.stringify(['PAXGUSDT']);
-      const mr = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(metalSyms)}`, { signal: AbortSignal.timeout(8000) });
-      if (mr.ok) {
-        const metals = await mr.json();
-        metals.forEach(t => {
-          if (t.symbol === 'PAXGUSDT') {
-            const usd = parseFloat(t.lastPrice);
-            metalsData['GOLD'] = { name:'ゴールド', icon:'🥇', unit:'Troy oz', usd, jpy:usd*jpy, thb:usd*thb, change:parseFloat(t.priceChangePercent)||0, cat:'METAL' };
-          }
-        });
-      }
-    } catch(e2) { console.warn('metals error:', e2); }
+      const r2 = await fetch('https://open.er-api.com/v6/latest/USD');
+      if (r2.ok) { const d2 = await r2.json(); jpy = d2.rates.JPY; thb = d2.rates.THB; }
+    } catch(e2) {}
+  }
 
-    // Silver: Gold/Silver ratio 約80で概算 (フォールバック)
-    if (metalsData['GOLD'] && !metalsData['SILVER']) {
-      const silverUsd = metalsData['GOLD'].usd / 80;
-      metalsData['SILVER'] = { name:'シルバー', icon:'🥈', unit:'Troy oz', usd:silverUsd, jpy:silverUsd*jpy, thb:silverUsd*thb, change:metalsData['GOLD'].change * 0.9, cat:'METAL' };
+  // Gold via PAXG on Binance
+  const metalsData = {};
+  try {
+    const mr = await fetch('https://api.binance.com/api/v3/ticker/24hr?symbols=' + encodeURIComponent('["PAXGUSDT"]'));
+    if (mr.ok) {
+      const md = await mr.json();
+      md.forEach(t => {
+        if (t.symbol === 'PAXGUSDT') {
+          const usd = parseFloat(t.lastPrice);
+          metalsData['GOLD'] = { name:'ゴールド', icon:'🥇', unit:'Troy oz', usd, jpy:usd*jpy, thb:usd*thb, change:parseFloat(t.priceChangePercent)||0, cat:'METAL' };
+          // Silver estimate from gold (ratio ~80)
+          const sUsd = usd / 80;
+          metalsData['SILVER'] = { name:'シルバー', icon:'🥈', unit:'Troy oz (概算)', usd:sUsd, jpy:sUsd*jpy, thb:sUsd*thb, change:metalsData['GOLD'].change * 0.85, cat:'METAL' };
+        }
+      });
     }
+  } catch(e) { console.warn('metals error:', e); }
 
-    return {
-      USDJPY: { name:'ドル円',  usd:1,     jpy:jpy,     thb:thb,   change:null, cat:'FOREX' },
-      THBJPY: { name:'バーツ円', usd:1/thb, jpy:jpy/thb, thb:1,     change:null, cat:'FOREX' },
-      ...metalsData,
-    };
-  } catch(e) { console.error('forex fetch error:', e); return {}; }
+  return {
+    USDJPY: { name:'ドル円',  usd:1, jpy, thb,    change:null, cat:'FOREX' },
+    THBJPY: { name:'バーツ円', usd:1/thb, jpy:jpy/thb, thb:1, change:null, cat:'FOREX' },
+    ...metalsData,
+  };
 }
-
 
 function fetchThai() {
   const out = {};
